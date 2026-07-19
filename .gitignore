@@ -1,0 +1,24 @@
+# macOS/editor files
+.DS_Store
+*.swp
+
+# Credentials and local environment
+.env
+.env.*
+!.env.example
+auth.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Machine-specific pi state and generated content
+trust.json
+models-store.json
+sessions/
+npm/
+git/
+bin/
+
+# Installer backups
+*.bak.*
