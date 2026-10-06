@@ -80,18 +80,6 @@ function thinkingColor(level: string): ThinkingColor {
 	}
 }
 
-function formatInt(value: number | null | undefined): string {
-	if (value === null || value === undefined || !Number.isFinite(value)) return "?";
-	return Math.max(0, Math.round(value)).toString();
-}
-
-function formatCompact(value: number | null | undefined): string {
-	if (value === null || value === undefined || !Number.isFinite(value)) return "?";
-	if (value >= 1_000_000) return `${Number.isInteger(value / 1_000_000) ? value / 1_000_000 : (value / 1_000_000).toFixed(1)}M`;
-	if (value >= 1_000) return `${Number.isInteger(value / 1_000) ? value / 1_000 : (value / 1_000).toFixed(1)}k`;
-	return Math.max(0, Math.round(value)).toString();
-}
-
 function aggregateAssistantUsage(ctx: ExtensionContext): { input: number; output: number; cost: number } {
 	let input = 0;
 	let output = 0;
@@ -106,6 +94,85 @@ function aggregateAssistantUsage(ctx: ExtensionContext): { input: number; output
 	}
 
 	return { input, output, cost };
+}
+
+type UsageLike = {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	cost?: { total?: number };
+};
+
+interface UsageStats {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	latestCacheHitRate: number | undefined;
+}
+
+/** Mirrors pi's built-in footer: cumulative usage over ALL session entries (incl. compacted). */
+function sessionUsageStats(ctx: ExtensionContext): UsageStats {
+	const stats: UsageStats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, latestCacheHitRate: undefined };
+	const add = (u: UsageLike | undefined) => {
+		if (!u) return;
+		stats.input += u.input ?? 0;
+		stats.output += u.output ?? 0;
+		stats.cacheRead += u.cacheRead ?? 0;
+		stats.cacheWrite += u.cacheWrite ?? 0;
+		stats.cost += u.cost?.total ?? 0;
+	};
+
+	for (const entry of ctx.sessionManager.getEntries() as any[]) {
+		if (entry.type === "usage") {
+			add(entry.usage);
+		} else if (entry.type === "message" && entry.message?.role === "assistant") {
+			const u = entry.message.usage as UsageLike | undefined;
+			add(u);
+			if (u) {
+				const prompt = (u.input ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+				stats.latestCacheHitRate = prompt > 0 ? ((u.cacheRead ?? 0) / prompt) * 100 : undefined;
+			}
+		} else if (entry.type === "message" && entry.message?.role === "toolResult" && entry.message.usage) {
+			add(entry.message.usage);
+		} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+			add(entry.usage);
+		}
+	}
+	return stats;
+}
+
+/** Same compact format as pi's default footer (1.3k, 103k, 1.0M). */
+function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
+function autoCompactEnabled(ctx: ExtensionContext): boolean {
+	let enabled = true;
+	const global = readJsonFile(join(CONFIG_DIR, "settings.json")) as any;
+	if (typeof global?.compaction?.enabled === "boolean") enabled = global.compaction.enabled;
+	if (ctx.isProjectTrusted()) {
+		const project = readJsonFile(join(ctx.cwd, ".pi", "settings.json")) as any;
+		if (typeof project?.compaction?.enabled === "boolean") enabled = project.compaction.enabled;
+	}
+	return enabled;
+}
+
+function usingSubscription(ctx: ExtensionContext): boolean {
+	const model = ctx.model;
+	if (!model) return false;
+	if (model.provider === "kimi-coding") return true;
+	try {
+		return ctx.modelRegistry.isUsingOAuth(model);
+	} catch {
+		return false;
+	}
 }
 
 function friendlyModelName(ctx: ExtensionContext): string {
@@ -151,7 +218,8 @@ export default function (pi: ExtensionAPI) {
 
 	function install(ctx: ExtensionContext) {
 		if (ctx.mode !== "tui") return;
-		thinkingLevel = latestThinkingLevel(ctx);
+		thinkingLevel = ctx.thinkingLevel ?? latestThinkingLevel(ctx);
+		const autoCompact = autoCompactEnabled(ctx);
 
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			const refresh = () => tui.requestRender();
@@ -185,9 +253,16 @@ export default function (pi: ExtensionAPI) {
 						(currentTokens !== null && currentTokens !== undefined && modelContext
 							? (currentTokens / modelContext) * 100
 							: null);
-					const contextLabel = `${formatInt(currentTokens)}/${formatInt(modelContext)} (${formatInt(contextPercent)}%)`;
-					const contextSegment = `${theme.fg("success", "▣ ")}${theme.fg("success", contextLabel)}`;
-					const modelSegment = `${theme.fg("accent", "🤖 ")}${theme.fg("accent", `${friendlyModelName(ctx)} (${formatCompact(modelContext)} context)`)}`;
+					// Context: used/window (pct) — colored by fill level; ♻ = auto-compaction on.
+					const pctValue = contextPercent ?? 0;
+					const pctText = contextPercent !== null && contextPercent !== undefined ? `${pctValue.toFixed(1)}%` : "?%";
+					const ctxColor = pctValue > 90 ? "error" : pctValue > 70 ? "warning" : "success";
+					const usedText = currentTokens !== null && currentTokens !== undefined ? formatTokens(currentTokens) : "?";
+					const contextLabel = `${usedText}/${modelContext ? formatTokens(modelContext) : "?"} (${pctText})`;
+					const contextSegment =
+						`${theme.fg(ctxColor, "🧠 ")}${theme.fg(ctxColor, contextLabel)}` +
+						(autoCompact ? theme.fg("dim", "  ♻  auto") : "");
+					const modelSegment = `${theme.fg("accent", "🤖 ")}${theme.fg("accent", friendlyModelName(ctx))}`;
 					const effortSegment = `${theme.fg("dim", "💡 ")}${theme.fg(thinkingColor(thinkingLevel), thinkingLevel)}`;
 
 					const otherStatuses = Array.from(footerData.getExtensionStatuses().entries())
@@ -197,7 +272,24 @@ export default function (pi: ExtensionAPI) {
 
 					const segments = [folderSegment, branchSegment, contextSegment, modelSegment, effortSegment, ...otherStatuses];
 					const line = segments.join(theme.fg("dim", "  "));
-					return [truncateToWidth(line, width, "…")];
+
+					// Session usage line (cumulative): in, out, cache read/write, cache hit, cost.
+					const stats = sessionUsageStats(ctx);
+					const seg = (icon: string, color: Parameters<typeof theme.fg>[0], text: string) =>
+						`${icon} ${theme.fg(color, text)}`;
+					const parts: string[] = [];
+					if (stats.input) parts.push(seg("📥", "muted", `${formatTokens(stats.input)} in`));
+					if (stats.output) parts.push(seg("📤", "muted", `${formatTokens(stats.output)} out`));
+					if (stats.cacheRead) parts.push(seg("⚡", "dim", `${formatTokens(stats.cacheRead)} cache read`));
+					if (stats.cacheWrite) parts.push(seg("💾", "dim", `${formatTokens(stats.cacheWrite)} cache write`));
+					if ((stats.cacheRead > 0 || stats.cacheWrite > 0) && stats.latestCacheHitRate !== undefined) {
+						parts.push(seg("🎯", "dim", `${stats.latestCacheHitRate.toFixed(1)}% hit`));
+					}
+					const sub = usingSubscription(ctx);
+					if (stats.cost || sub) parts.push(seg("💰", "warning", `$${stats.cost.toFixed(3)}${sub ? " (sub)" : ""}`));
+
+					const statsLine = parts.length > 0 ? parts.join(theme.fg("dim", "  ")) : theme.fg("dim", "📊 no usage yet");
+					return [truncateToWidth(line, width, "…"), truncateToWidth(statsLine, width, "…")];
 				},
 			};
 		});
